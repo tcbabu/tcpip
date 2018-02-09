@@ -1,0 +1,1295 @@
+
+/******************************************************************************                  
+                            SERVER PROGRAM
+This program waits to establish connection with clients, executes
+the command send by the clients and redirect the output to the clients.
+Server is communicating with client through port number 1038.
+
+******************************************************************************/ 
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/ipc.h>
+#include <sys/sem.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <malloc.h>
+#include <sched.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <signal.h>
+#include <sys/reboot.h>
+#include <sys/poll.h>
+#include <pthread.h>
+
+
+#define TRUE 1
+#define SPACE ' '
+#define TIMEOUT -3000
+#define RTIMEOUT 20000
+#define MAXTHDS 200
+
+char newline='\n';
+pthread_t pth[MAXTHDS];
+int msgsock[MAXTHDS];
+pthread_mutex_t lock;
+int idleper;
+pthread_mutex_t lock1;
+
+
+typedef struct action {
+  char *code; /* command code */
+  int (*outprocess)(int output_socket,int input_pipe);
+  char **(*getargv)(char **); /* command and its arguments, last being NULL */
+} ACTION;
+
+/********************************************************************
+  ds     disk space
+  sl     load on a system 
+  ut     load and uptime
+  so     switch-off userful for nodes; uses system call reboot; so syncing
+  pd     powerdown 
+  rs     restart a system
+  rc     system resource 
+  nr     reset eth0  
+  ad     add user 
+  pw     changing passwd of a user
+  up     returns up if node is up
+  st    returns temarature
+  kj    kills a sid of user; -s <sid> is args
+  ex    execultes a job
+********************************************************************/
+
+                       /* FUNCTION DECLARATIONS */ 
+
+int outprocessdf(int,int);
+char **args(char *);
+char *pgetline(int);
+char * getfrompipe(int pipe1, int timeout) ;
+int  process (char *,int,int (*outproc)(int ,int)) ;
+int writesock(int,int);
+int  cmnderror(int);
+int msgsend(int);
+int  process_action (ACTION *act,int msgsock,char **pt);
+/**********  New Code for getting IdleTime                          ***/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+
+#include <time.h>
+#include <unistd.h>
+#include <values.h>
+
+
+int read_sock(int sock,char *data,int count) {
+	int ret;
+	struct pollfd pfd;
+
+	pfd.fd = sock;
+	pfd.events = POLLIN |POLLRDHUP;
+	pfd.revents = 0;
+
+	/*Poll for data from the node*/
+	ret = poll(&pfd,1,RTIMEOUT);
+	if(ret == -1) { 
+         fprintf(stderr,"Client socket timed out...\n");
+        }
+        else {
+          ret =0;
+	  if(pfd.revents & POLLIN) { ret = read(sock,data,count); }
+          else {
+            fprintf(stderr,"Client socket error...\n");
+          }
+        }
+
+	return ret;
+}
+
+int write_sock(int sock,char *data,int count) {
+	int ret;
+	struct pollfd pfd;
+
+	pfd.fd = sock;
+	pfd.events = POLLOUT|POLLRDHUP;
+	pfd.revents = 0;
+
+	/*Poll for data from the node*/
+	ret = poll(&pfd,1,TIMEOUT);
+	if(ret == -1) { perror("poll timeout"); }
+        else {
+          ret =0;
+	  if(pfd.revents & POLLOUT) { ret = write(sock,data,count); }
+          /* Other checks possible....*/
+        }
+
+	return ret;
+}
+
+#define CACHE_TWEAK_FACTOR 64
+#define SMLBUFSIZ ( 256 + CACHE_TWEAK_FACTOR)
+typedef unsigned long long TIC_t;
+typedef          long long SIC_t;
+typedef struct CPU_t {
+   TIC_t u, n, s, i, w, x, y, z; // as represented in /proc/stat
+   TIC_t u_sav, s_sav, n_sav, i_sav, w_sav, x_sav, y_sav, z_sav; // in the order of our display
+   unsigned id;  // the CPU ID number
+} CPU_t;
+
+
+static int  Cpu_tot;
+
+
+//static void *alloc_c (unsigned numb) MALLOC;
+static void *alloc_c (unsigned numb)
+{
+   void * p;
+
+   if (!numb) ++numb;
+   if (!(p = calloc(1, numb)))
+      fprintf(stderr,"failed memory allocate\n");
+   return p;
+}
+
+static CPU_t *cpus_refresh (CPU_t *cpus)
+{
+   static FILE *fp = NULL;
+   int i;
+   int num;
+   // enough for a /proc/stat CPU line (not the intr line)
+   char buf[SMLBUFSIZ];
+
+   /* by opening this file once, we'll avoid the hit on minor page faults
+      (sorry Linux, but you'll have to close it for us) */
+   if (!fp) {
+      if (!(fp = fopen("/proc/stat", "r")))
+         fprintf(stderr,"Failed to open /proc/stat\n");
+      cpus = alloc_c((1 + Cpu_tot) * sizeof(CPU_t));
+   }
+   rewind(fp);
+   fflush(fp);
+
+   // first value the last slot with the cpu summary line
+   if (!fgets(buf, sizeof(buf), fp)) fprintf(stderr,"failed /proc/stat read\n");
+   cpus[Cpu_tot].x = 0;  // FIXME: can't tell by kernel version number
+   cpus[Cpu_tot].y = 0;  // FIXME: can't tell by kernel version number
+   cpus[Cpu_tot].z = 0;  // FIXME: can't tell by kernel version number
+   num = sscanf(buf, "cpu %Lu %Lu %Lu %Lu %Lu %Lu %Lu %Lu",
+      &cpus[Cpu_tot].u,
+      &cpus[Cpu_tot].n,
+      &cpus[Cpu_tot].s,
+      &cpus[Cpu_tot].i,
+      &cpus[Cpu_tot].w,
+      &cpus[Cpu_tot].x,
+      &cpus[Cpu_tot].y,
+      &cpus[Cpu_tot].z
+   );
+   if (num < 4)
+         fprintf(stderr,"failed /proc/stat read\n");
+
+   // and just in case we're 2.2.xx compiled without SMP support...
+   if (Cpu_tot == 1) {
+      cpus[1].id = 0;
+      memcpy(cpus, &cpus[1], sizeof(CPU_t));
+   }
+#if 0
+   // now value each separate cpu's tics
+   for (i = 0; 1 < Cpu_tot && i < Cpu_tot; i++) {
+      if (!fgets(buf, sizeof(buf), fp)) fprintf(stderr,"failed /proc/stat read\n");
+      cpus[i].x = 0;  // FIXME: can't tell by kernel version number
+      cpus[i].y = 0;  // FIXME: can't tell by kernel version number
+      cpus[i].z = 0;  // FIXME: can't tell by kernel version number
+      num = sscanf(buf, "cpu%u %Lu %Lu %Lu %Lu %Lu %Lu %Lu %Lu",
+         &cpus[i].id,
+         &cpus[i].u, &cpus[i].n, &cpus[i].s, &cpus[i].i, &cpus[i].w, &cpus[i].x, &cpus[i].y, &cpus[i].z
+      );
+      if (num < 4)
+            fprintf(stderr,"failed /proc/stat read\n");
+   }
+#endif
+   return cpus;
+}
+
+static float summaryhlp (CPU_t *cpu, const char *pfx)
+{
+   // we'll trim to zero if we get negative time ticks,
+   // which has happened with some SMP kernels (pre-2.4?)
+#define TRIMz(x)  ((tz = (SIC_t)(x)) < 0 ? 0 : tz)
+   SIC_t u_frme, s_frme, n_frme, i_frme, w_frme, x_frme, y_frme, z_frme, tot_frme, tz;
+   float scale;
+
+   u_frme = cpu->u - cpu->u_sav;
+   s_frme = cpu->s - cpu->s_sav;
+   n_frme = cpu->n - cpu->n_sav;
+   i_frme = TRIMz(cpu->i - cpu->i_sav);
+   w_frme = cpu->w - cpu->w_sav;
+   x_frme = cpu->x - cpu->x_sav;
+   y_frme = cpu->y - cpu->y_sav;
+   z_frme = cpu->z - cpu->z_sav;
+   tot_frme = u_frme + s_frme + n_frme + i_frme + w_frme + x_frme + y_frme + z_frme;
+   if (tot_frme < 1) tot_frme = 1;
+   scale = 100.0 / (float)tot_frme;
+
+   // display some kinda' cpu state percentages
+   // (who or what is explained by the passed prefix)
+   // remember for next time around
+   cpu->u_sav = cpu->u;
+   cpu->s_sav = cpu->s;
+   cpu->n_sav = cpu->n;
+   cpu->i_sav = cpu->i;
+   cpu->w_sav = cpu->w;
+   cpu->x_sav = cpu->x;
+   cpu->y_sav = cpu->y;
+   cpu->z_sav = cpu->z;
+   return (float)i_frme * scale;
+
+#undef TRIMz
+}
+
+
+static float GetIdleTime (void)
+{
+   static CPU_t  *smpcpu = NULL;
+   float ret =0.;
+
+   smpcpu = cpus_refresh(smpcpu);
+   ret = summaryhlp(&smpcpu[Cpu_tot], "Cpu(s):");
+//   printf("Idle : %f\n",ret);
+   return ret;
+}
+#if 0
+int main (int dont_care_argc, char *argv[])
+{
+   float idletime=0;
+   for (;;) {
+      idletime = GetIdleTime();
+      sleep(5);
+   }
+   return 0;
+}
+#endif
+/*************     End of Idle Time code                            ***/
+
+int Free(char **ptr) {
+ int i=0;
+ while(ptr[i] != NULL) free(ptr[i]);
+ free(ptr);
+}
+
+/*************************************************************************
+  int getting a line from a given pipe within a given time(secs)
+  on success returns 1 else return 0
+**************************************************************************/
+char * getfrompipe(int pipe1, int timeout) {
+  int  status,retval;
+  char *pt=NULL;
+  struct timeval tv;
+  fd_set rfds;
+
+  FD_ZERO(&rfds);
+  FD_SET(pipe1,&rfds);
+  tv.tv_sec=timeout;
+  tv.tv_usec=0;
+  retval=select(pipe1+1,&rfds,NULL,NULL,&tv);   
+                   /* it checks whether the descriptor is ready */ 
+  if ((retval>0)&&(FD_ISSET(pipe1,&rfds))){
+    pt = pgetline(pipe1);
+  }
+  return pt;
+}
+                
+/******************************************************************************           
+                         'ds' COMMAND PROCESSING
+Recieves the socket descriptor and pipe descriptor as arguments.
+'ds' command returns the available space and mounted devices on the filesystem.
+Returns an integer.
+******************************************************************************/           
+
+int outprocessdf(int msgsock,int pipe1) {
+    char *pt,*ptr,wr[1000];
+    char file[100],mount[100];
+    char avail[]="Available"; 
+    int  block,use,pid,status,per;
+    float avble;
+    char file1[]="File system";
+    char per1[]="Use%";
+    if((ptr=getfrompipe(pipe1,2))!=NULL){
+      free(ptr);
+      gethostname(wr,99);
+      strcat(wr,"\n");
+      write_sock(msgsock,wr,strlen(wr));
+/*
+    sprintf(wr,"%s        %s      %s\n",file1,avail,per1);
+    write(msgsock,wr,strlen(wr));
+*/
+      while((ptr=getfrompipe(pipe1,2))!=NULL){
+        sscanf(ptr,"%s %d %d %f %d %s",file,&block,&use,&avble,&per,mount);
+        avble=avble/1000;
+        sprintf(wr,"%20s %6.1f MB (%3d\% ) free\n",file,avble,100-per);
+        write_sock(msgsock,wr,strlen(wr));
+        free(ptr);
+      }
+    }
+    msgsend(msgsock);
+    return(0);
+}
+
+char **get_ds_command(char **command) {
+  char **pt;
+  pt = (char **) malloc(sizeof(char *)*2);
+  pt[0]= (char *)malloc(sizeof(char)*3);
+  strcpy(pt[0],"df");
+  pt[1]=NULL;
+  return pt;
+}
+/*************************************************************************
+  sl command processing; gives information about the system load
+**************************************************************************/
+
+char **get_sl_command(char **command) {
+  char **pt;
+  pt = (char **) malloc(sizeof(char *)*2);
+  pt[0]= (char *)malloc(sizeof(char)*7);
+  strcpy(pt[0],"uptime");
+  pt[1]=NULL;
+  return pt;
+}
+
+int outprocesssl(int msgsock,int pipe1) {
+    char *pt,*ptr,wr[1000],host[100];
+    int  ln,idle,i,i1,i2;
+    float load1,load2,load3;
+    char dummy1[20],dummy2[5],uptime[15];
+
+      if((ptr=getfrompipe(pipe1,1))!=NULL){
+        i=0;
+        while(ptr[i] >=' ') {if(ptr[i]==',') ptr[i]=' ';i++;}
+        i=0;
+        while(ptr[i] !='u') {i++;}
+        i +=2;
+        i1 = i;
+        while(ptr[i] !='u') {i++;}
+        i--;
+        while(ptr[i] ==' ') {i--;}
+        i--;
+        while(ptr[i] !=' ') {i--;}
+        i--;
+        while(ptr[i] ==' ') {i--;}
+        i2=i+1;
+        for(i=i1;i<i2;i++) uptime[i-i1]=ptr[i];
+        uptime[i2-i1]='\0';
+       //ln = strlen(ptr);
+       // while( (ln> 0) &&(ptr[ln] <= ' ')) ln--;
+//        pthread_mutex_lock(&lock1);
+#if 0
+        idle = idleper;
+#else
+        idle = (int) GetIdleTime();
+#endif
+//        pthread_mutex_unlock(&lock1);
+        gethostname(host,99);
+        if(idle > 80) sprintf(wr,"%25s %3d%c idle (up for %s) :not loaded\n",host,idle,'%',uptime);
+        else sprintf(wr,"%25s %3d%c idle (up for %s) :loaded \n",host,idle,'%',uptime);
+        write_sock(msgsock,wr,strlen(wr));
+        free(ptr);
+      }
+    msgsend(msgsock);
+    return(0);
+}
+char **get_ut_command(char **command) {
+  char **pt;
+  pt = (char **) malloc(sizeof(char *)*2);
+  pt[0]= (char *)malloc(sizeof(char)*7);
+  strcpy(pt[0],"uptime");
+  pt[1]=NULL;
+  return pt;
+}
+int outprocessut(int msgsock,int pipe1) {
+    char *pt,*ptr,wr[1000],host[100];
+    int  ln,idle,i,i1,i2;
+    double ut;
+    FILE *fp;
+    float load1,load2,load3;
+    char dummy1[20],dummy2[5],uptime[15];
+    fp = fopen("/proc/uptime","r");
+    if (fp!=NULL) {
+
+      fscanf(fp,"%lf",&ut);
+      fclose(fp);
+    }
+    else ut =0;
+      if((ptr=getfrompipe(pipe1,1))!=NULL){
+        i=0;
+        while(ptr[i] >=' ') {if(ptr[i]==',') ptr[i]=' ';i++;}
+        i=0;
+        while(ptr[i] !='u') {i++;}
+        i +=2;
+        i1 = i;
+        while(ptr[i] !='u') {i++;}
+        i--;
+        while(ptr[i] ==' ') {i--;}
+        i--;
+        while(ptr[i] !=' ') {i--;}
+        i--;
+        while(ptr[i] ==' ') {i--;}
+        i2=i+1;
+        for(i=i1;i<i2;i++) uptime[i-i1]=ptr[i];
+        uptime[i2-i1]='\0';
+       //ln = strlen(ptr);
+       // while( (ln> 0) &&(ptr[ln] <= ' ')) ln--;
+//        pthread_mutex_lock(&lock1);
+#if 0
+        idle = idleper;
+#else
+        idle = (int) GetIdleTime();
+#endif
+
+//        pthread_mutex_unlock(&lock1);
+        gethostname(host,99);
+        sprintf(wr,"%d %Ld \n",100-idle,(long long)(ut));
+        write(msgsock,wr,strlen(wr));
+        free(ptr);
+      }
+    msgsend(msgsock);
+    return(0);
+}
+
+/*************************************************************************
+  st command processing; gives information about the system temparature
+**************************************************************************/
+
+char **get_st_command(char **command) {
+  char **pt;
+  pt = (char **) malloc(sizeof(char *)*3);
+  pt[0]= (char *)malloc(sizeof(char)*4);
+  pt[1]= (char *)malloc(sizeof(char)*40);
+  strcpy(pt[0],"cat");
+  strcpy(pt[1],"/proc/acpi/thermal_zone/THRM/temperature");
+  pt[2]=NULL;
+  return pt;
+}
+
+int outprocessst(int msgsock,int pipe1) {
+    char *pt,*ptr,wr[1000],host[100];
+    int  ln,temp;
+
+    if((ptr=getfrompipe(pipe1,2))!=NULL){
+      sscanf(ptr,"%s%d",host,&temp);
+      free(ptr);
+      gethostname(host,99);
+      sprintf(wr,"%s %3d C\n",host,temp);
+      write_sock(msgsock,wr,strlen(wr));
+    }
+    msgsend(msgsock);
+    return(0);
+}
+ 
+/********************************************************************
+  so command: shutdown a node; switching off; no syncing
+********************************************************************/
+char **get_so_command(char **command) {
+  char **pt;
+#if 0
+  pt = (char **) malloc(sizeof(char *)*4);
+  pt[0]= (char *)malloc(sizeof(char)*9);
+  pt[1]= (char *)malloc(sizeof(char)*2);
+  pt[2]= (char *)malloc(sizeof(char)*4);
+  strcpy(pt[0],"shutdown");
+  strcpy(pt[1],"-h");
+  strcpy(pt[2],"now");
+  pt[3]=NULL;
+#else
+/****** Shutting down in new form *********/
+  pt = (char **) malloc(sizeof(char *)*2);
+  pt[0]= (char *)malloc(sizeof(char)*10);
+  
+  strcpy(pt[0],"hostname");
+  pt[1]=NULL;
+/*********************     end of new code dt. 11-9-04 */
+#endif
+  return pt;
+}
+int outprocessso(int msgsock,int pipe1) {
+    char *pt,*ptr,wr[1000],host[100];
+    int  ln,idle;
+
+    if((ptr=getfrompipe(pipe1,3))!=NULL){
+        sprintf(wr,"powering off %s \n",ptr);
+        free(ptr);
+    }
+    else {
+        sprintf(wr,"OK\n");
+    }
+    write_sock(msgsock,wr,strlen(wr));
+    msgsend(msgsock);
+    usleep(50000);
+    sync();
+    sync();
+    reboot(RB_POWER_OFF);
+    return(0);
+}
+
+/********************************************************************
+  pd command: shutdown a system (power down)
+********************************************************************/
+
+char **get_pd_command(char **command) {
+  char **pt;
+#if 1
+  pt = (char **) malloc(sizeof(char *)*4);
+  pt[0]= (char *)malloc(sizeof(char)*9);
+  pt[1]= (char *)malloc(sizeof(char)*2);
+  pt[2]= (char *)malloc(sizeof(char)*4);
+  strcpy(pt[0],"shutdown");
+  strcpy(pt[1],"-h");
+  strcpy(pt[2],"now");
+  pt[3]=NULL;
+#else
+/****** Shutting down in new form *********/
+  pt = (char **) malloc(sizeof(char *)*3);
+  pt[0]= (char *)malloc(sizeof(char)*5);
+  pt[1]= (char *)malloc(sizeof(char)*9);
+    usleep(50000);
+    sync();
+    sync();
+    reboot(RB_POWER_OFF);
+  
+  strcpy(pt[0],"echo");
+  strcpy(pt[1],"poweroff");
+  pt[2]=NULL;
+/*********************     end of new code dt. 11-9-04 */
+#endif
+  return pt;
+}
+
+int outprocesspd(int msgsock,int pipe1) {
+    char *pt,*ptr,wr[1000],host[100];
+    int  ln,idle;
+
+    while((ptr=getfrompipe(pipe1,3))!=NULL){
+        free(ptr);
+    }
+    msgsend(msgsock);
+    return(0);
+}
+/********************************************************************
+  rs command: restart  a system
+********************************************************************/
+
+char **get_rs_command(char **command) {
+  char **pt;
+#if 0
+  pt = (char **) malloc(sizeof(char *)*4);
+  pt[0]= (char *)malloc(sizeof(char)*9);
+  pt[1]= (char *)malloc(sizeof(char)*2);
+  pt[2]= (char *)malloc(sizeof(char)*4);
+  strcpy(pt[0],"shutdown");
+  strcpy(pt[1],"-r");
+  strcpy(pt[2],"now");
+  pt[3]=NULL;
+#else
+  pt = (char **) malloc(sizeof(char *)*2);
+  pt[0]= (char *)malloc(sizeof(char)*7);
+  strcpy(pt[0],"reboot");
+  pt[1]=NULL;
+#endif
+  return pt;
+}
+
+int outprocessrs(int msgsock,int pipe1) {
+    char *pt,*ptr,wr[1000],host[100];
+    int  ln,idle;
+
+    while((ptr=getfrompipe(pipe1,3))!=NULL){
+        free(ptr);
+    }
+    msgsend(msgsock);
+    return(0);
+}
+/********************************************************************
+  rc command: resource information
+********************************************************************/
+
+char **get_rc_command(char **command) {
+  char **pt;
+  pt = (char **) malloc(sizeof(char *)*2);
+  pt[0]= (char *)malloc(sizeof(char)*5);
+  strcpy(pt[0],"free");
+  pt[1]=NULL;
+  return pt;
+}
+
+int outprocessrc(int msgsock,int pipe1) {
+    char *pt,*ptr,wr[1000],host[100];
+    int  mem,sw,memu,swu,dummy,memf,swf;
+    
+    if((ptr = getfrompipe(pipe1,3)) != NULL) free(ptr) ;
+    if((ptr=getfrompipe(pipe1,3))!=NULL){
+        sscanf(ptr,"%s %d %d %d",host,&mem,&memu,&memf);
+        free(ptr);
+    }
+    if((ptr = getfrompipe(pipe1,3)) != NULL) free(ptr) ;
+    if((ptr=getfrompipe(pipe1,3))!=NULL){
+        sscanf(ptr,"%s %d %d %d",host,&sw,&swu,&swf);
+        free(ptr);
+    }
+    gethostname(wr,99);
+    strcat(wr,"\n");
+    write_sock(msgsock,wr,strlen(wr));
+
+    memf = (float) (mem -memu)/((float)mem)*100+0.5;
+    swf = (float) (sw -swu)/((float)sw)*100+0.5;
+    
+    sprintf(wr,"  Memory: %4d MB %3d%c free\n",mem/1000,memf,'%');
+    write_sock(msgsock,wr,strlen(wr));
+    sprintf(wr,"  Swap  : %4d MB %3d%c free\n",sw/1000,swf,'%');
+    write_sock(msgsock,wr,strlen(wr));
+    
+    msgsend(msgsock);
+    return(0);
+}
+/***************************************************************************/
+
+/********************************************************************
+  nr command: resetting eth0
+********************************************************************/
+
+char **get_nr_command(char **command) {
+  char **pt;
+  pt = (char **) malloc(sizeof(char *)*5);
+  pt[0]= (char *)malloc(sizeof(char)*15);
+  strcpy(pt[0],"/sbin/ifconfig");
+  pt[1]= (char *)malloc(sizeof(char)*5);
+  strcpy(pt[1],"eth0");
+  pt[2]= (char *)malloc(sizeof(char)*5);
+  strcpy(pt[2],"down");
+  pt[3]= (char *)malloc(sizeof(char)*3);
+  strcpy(pt[3],"up");
+  pt[4]=NULL;
+  return pt;
+}
+
+int outprocessnr(int msgsock,int pipe1) {
+    char *pt,*ptr,wr[1000],host[100];
+    int  mem,sw,memu,swu,dummy,memf,swf;
+    
+    if((ptr=getfrompipe(pipe1,3))!=NULL){
+        sprintf(wr,"%s\n",ptr);
+        free(ptr);
+    }
+    else {
+        sprintf(wr,"OK\n");
+    }
+    write_sock(msgsock,wr,strlen(wr));
+    
+    msgsend(msgsock);
+    return(0);
+}
+/***************************************************************************/
+
+/********************************************************************
+  ad command: add new user
+********************************************************************/
+
+char **get_ad_command(char **command) {
+  char **pt;
+  pt = (char **) malloc(sizeof(char *)*3);
+  pt[0]= (char *)malloc(18);
+  strcpy(pt[0],"/usr/bin/newusr");
+  if( command[1] != NULL) {
+    pt[1]= (char *)malloc(strlen(command[1]+1));
+    strcpy(pt[1],command[1]);
+  }
+  else {
+    pt[1]= (char *)malloc(6);
+    strcpy(pt[1],"paras");
+  }
+  pt[2]=NULL;
+  return pt;
+}
+
+int outprocessad(int msgsock,int pipe1) {
+    char *pt,*ptr,wr[1000],host[100];
+    int  mem,sw,memu,swu,dummy,memf,swf;
+    
+    if((ptr=getfrompipe(pipe1,3))!=NULL){
+        sprintf(wr,"%s\n",ptr);
+        free(ptr);
+    }
+    else {
+        sprintf(wr,"FAILED\n");
+    }
+    write_sock(msgsock,wr,strlen(wr));
+    
+    msgsend(msgsock);
+    return(0);
+}
+/***************************************************************************/
+
+/********************************************************************
+  pw command: change password  user
+********************************************************************/
+
+char **get_pw_command(char **command) {
+  char **pt;
+  pt = (char **) malloc(sizeof(char *)*4);
+  pt[0]= (char *)malloc(20);
+  strcpy(pt[0],"/usr/bin/chngpswd");
+  if( command[1] != NULL) {
+    pt[1]= (char *)malloc(strlen(command[1]+1));
+    strcpy(pt[1],command[1]);
+  }
+  else {
+    pt[1]= NULL;
+  }
+  if( command[2] != NULL) {
+    pt[2]= (char *)malloc(strlen(command[2]+1));
+    strcpy(pt[2],command[2]);
+  }
+  else {
+    pt[2]= NULL;
+  }
+  pt[3]=NULL;
+  return pt;
+}
+
+int outprocesspw(int msgsock,int pipe1) {
+    char *pt,*ptr,wr[1000],host[100];
+    int  mem,sw,memu,swu,dummy,memf,swf;
+    
+    if((ptr=getfrompipe(pipe1,3))!=NULL){
+        sprintf(wr,"%s\n",ptr);
+        free(ptr);
+    }
+    else {
+        sprintf(wr,"FAILED\n");
+    }
+    write_sock(msgsock,wr,strlen(wr));
+    
+    msgsend(msgsock);
+    return(0);
+}
+/********************************************************************
+  up command: status check just returns up
+********************************************************************/
+
+char **get_up_command(char **command) {
+  char **pt;
+  pt = (char **) malloc(sizeof(char *)*2);
+  pt[0]= (char *)malloc(20);
+//  strcpy(pt[0],"/bin/echo");
+  strcpy(pt[0],"/usr/bin/uptime");
+//  pt[1]= (char *)malloc(3);
+//  strcpy(pt[1],"up");
+  pt[1]= NULL;
+  return pt;
+}
+
+int outprocessup(int msgsock,int pipe1) {
+    char *pt,*ptr,wr[1000],buff[100];
+    int  mem,sw,memu,swu,dummy,memf,swf;
+    int i=0;
+    
+    gethostname(wr,99);
+    if((ptr=getfrompipe(pipe1,3))!=NULL){
+        strcat(wr,"   ");
+        pt = ptr;
+        while(*pt==' ')pt++;
+        while(*pt!=' ')pt++; while(*pt==' ')pt++;
+        while(pt[i] >= ' ') {if(pt[i] == ',') pt[i]=' ';i++;}
+        strcat(wr,pt);
+        free(ptr);
+    }
+    else {
+        sprintf(wr,"FAILED\n");
+    }
+    write_sock(msgsock,wr,strlen(wr));
+    
+    msgsend(msgsock);
+    return(0);
+}
+/***************************************************************************/
+
+/********************************************************************
+  ex command: execute a program
+  not complete yet
+********************************************************************/
+
+char **get_ex_command(char **command) {
+  int i=0,ln;
+  char **pt;
+#if 0
+  while (command[i] != NULL)i++;
+  pt = (char **) malloc(sizeof(char *)*(i+1));
+  pt[0]=(char *)malloc(sizeof(char)*20);
+  strcpy(pt[0],"/usr/bin/runajob");
+  i =1;
+  while( command[i] != NULL) {
+    pt[i]= (char *)malloc(strlen(command[i]+1));
+    strcpy(pt[i],command[i]);
+    i++;
+  }
+  pt[i]=NULL;
+#else
+  pt = (char **) malloc(sizeof(char *)*(5));
+  pt[0]=(char *)malloc(sizeof(char)*20);
+  pt[1]=(char *)malloc(sizeof(char)*10);
+  pt[2]=(char *)malloc(sizeof(char)*10);
+  pt[3]=(char *)malloc(sizeof(char)*300);
+  strcpy(pt[0],"/bin/bash");
+  strcpy(pt[1],"-l");
+  strcpy(pt[2],"-c");
+  strcpy(pt[3],"/usr/bin/runajob");
+  i =1;
+  while( command[i] != NULL) {
+    ln = strlen(pt[3]);
+    strcpy(pt[3]+ln," ");
+    ln = strlen(pt[3]);
+    strcpy(pt[3]+ln,command[i]);
+    i++;
+  }
+  pt[4]=NULL;
+#endif
+  return pt;
+}
+
+int outprocessex(int msgsock,int pipe1) {
+    char *ptr,wr[1000];
+    
+    while((ptr=getfrompipe(pipe1,3))!=NULL){
+        sprintf(wr,"%s",ptr);
+        write_sock(msgsock,wr,strlen(wr));
+        free(ptr);
+    }
+    
+    msgsend(msgsock);
+    return(0);
+}
+char **get_kj_command(char **command) {
+  int i=0;
+  char **pt;
+  while (command[i] != NULL)i++;
+  pt = (char **) malloc(sizeof(char *)*(i+2));
+  pt[0]=(char *)malloc(sizeof(char)*20);
+  pt[1]=(char *)malloc(sizeof(char)*4);
+  strcpy(pt[0],"/usr/bin/pkill");
+  strcpy(pt[1],"-s");
+  i =1;
+  while( command[i] != NULL) {
+    pt[i+1]= (char *)malloc(strlen(command[i]+1));
+    strcpy(pt[i+1],command[i]);
+    i++;
+  }
+  pt[i+1]=NULL;
+  return pt;
+}
+
+int outprocesskj(int msgsock,int pipe1) {
+    char *ptr,wr[1000];
+#if 1    
+    while((ptr=getfrompipe(pipe1,3))!=NULL){
+        sprintf(wr,"%s",ptr);
+        write_sock(msgsock,wr,strlen(wr));
+        free(ptr);
+    }
+#endif
+    
+    msgsend(msgsock);
+    return(0);
+}
+/***************************************************************************/
+
+ACTION actions[13] = {
+  {"ds",outprocessdf,get_ds_command}, /* disk space */
+  {"sl",outprocesssl,get_sl_command}, /* load on a system */
+  {"ut",outprocessut,get_ut_command}, /* load and uptime */
+  {"so",outprocessso,get_so_command}, /* Switch off; no syncing */
+  {"pd",outprocesspd,get_pd_command}, /* powerdown */
+  {"rs",outprocessrs,get_rs_command}, /* restart a system */
+  {"rc",outprocessrc,get_rc_command}, /* system resource */
+  {"nr",outprocessnr,get_nr_command}, /* reset eth0  */
+//  {"ad",outprocessad,get_ad_command}, /* add user */
+//  {"pw",outprocesspw,get_pw_command}, /* changing passwd of a user */
+  {"ex",outprocessex,get_ex_command}, /* execute a program */
+  {"up",outprocessup,get_up_command}, /* returns just "up" */
+  {"st",outprocessst,get_st_command}, /* returns temparature */
+  {"kj",outprocesskj,get_kj_command}, /* returns temparature */
+  {NULL,NULL,NULL}
+};
+
+/******************************************************************************                    
+                      COMMAND SELECTION   
+Recieves the new command and the socket descriptor as argument.
+Determines the command recieved and calls the respective function.
+Returns an integer.
+******************************************************************************/
+int compare(char *buf,int msgsock){
+    char buf1[]="df";
+    int  comp=0,pipe1;
+    int i=0;
+    char **pt;
+    if(buf== NULL) {cmnderror(msgsock); return 0;}
+    if(buf[0] < ' ') {cmnderror(msgsock); return 0;}
+    pt = args(buf);
+    while ( actions[i].code != NULL) {
+       if( strcmp(actions[i].code,pt[0])==0){
+           process_action(actions+i,msgsock,pt);
+           free(pt[0]);
+           free(pt);
+           return 1;
+       }
+       i++;
+    }
+    if(comp==0)cmnderror(msgsock);
+    free(pt[0]);
+    free(pt);
+    return (0); 
+}
+
+
+/******************************************************************************
+               COUNTING NUMBER OF ARGUMENTS IN THE COMMAND
+Recieves the command as argument.
+Calculates the number of arguments in the command. 
+Returns the number of arguments.             
+******************************************************************************/
+
+int wordcount(char *buf){
+    int count=1;
+    char *tmp;
+
+    tmp=buf;
+    while(1){
+      while((*tmp!=SPACE)&&(*tmp!='\0')){
+       tmp++;
+      }
+      if(*tmp=='\0')break;
+      count++;
+      tmp++;
+    }
+    return count;
+}
+/*******************************************************************************
+                SPLITTING THE COMMAND INTO ARGUMENTS
+Recieves the command and number of arguments.
+Splits the command into arguments.
+Returns the pointer to array of pointers to the arguments.
+*******************************************************************************/
+
+char **args(char *buf){
+    char *pt,**ptr;
+    int count1=0,count;
+
+    count=wordcount(buf);
+    count1=strlen(buf);
+    pt = (char *)malloc(sizeof(char)*(count1+1));
+    ptr=(char **)malloc(sizeof(char *)*(count+1));
+    strcpy(pt,buf);
+    while(1){
+      *ptr=pt;
+      while((*pt!=SPACE)&&(*pt!='\0')){
+         pt++;
+      }
+      if(*pt=='\0')break;
+      *pt='\0';
+      pt++;
+      ptr++;
+    }
+    ptr++;
+    *ptr=NULL;
+    ptr=ptr-count; 
+    return (ptr);  
+}  
+/*******************************************************************************
+                       GETTING A SINGLE LINE OF THE OUTPUT
+Recieves the pipe descriptor as argument.
+Gets a single line of the output from the pipe.
+Returns the pointer to the line.
+It is the responsibility of the user to free the memory
+to avoid memory leakage
+
+*******************************************************************************/
+
+char *pgetline(int pipe) {
+  char buff[1000];
+  char *pt=NULL;
+  int count =0;
+
+  while(1){
+   if((read(pipe,buff+count,1))<=0)break;
+   count++;
+   if(buff[count-1]=='\n') break;
+   if(count>999) count=999;
+  }
+  buff[count]='\0';
+   
+  if(count > 0) {
+    pt = (char *)malloc(sizeof(char)*(count+1));
+    strcpy(pt,buff);
+    memset(buff,0,sizeof (buff));
+  }
+  return pt;
+}
+/*******************************************************************************
+                      EXECUTION OF THE COMMAND
+Recieves the command,socket descriptor and the pointer to the function
+which process the output.
+Executes the command.
+Returns the pipe descriptor.
+*******************************************************************************/
+
+int  process (char * buf,int msgsock,int(*outproc)(int ,int)) {                       
+  char *ptr,*pt,**ret;
+  int  pipe1[2];
+  int  pid,status;
+
+  if(pipe(pipe1)!=0) perror("can't create pipes");
+  ret=args(buf);
+  pt=*ret;
+  if((pid=fork())<0)perror("FORK ERROR");
+  else 
+   if (pid==0){
+      close(pipe1[0]);
+      close(1); 
+      if (( dup(pipe1[1]))<0) perror("can't dup");
+      if ((execvp(pt,ret))<0){          /* command execution */
+         cmnderror(msgsock);  
+         exit(0);
+      }                                                                                     
+      exit(127);
+   } 
+   close(pipe1[1]);
+   outproc(msgsock,pipe1[0]);
+//   kill(pid,SIGINT);       /* killing the child process */
+   if((pid=waitpid(pid,&status,0))<0)perror("wait pid error");
+   close(pipe1[0]);
+   free(pt);
+   free(ret);
+   return  1;
+}
+int  process_action (ACTION *act,int msgsock,char **pt) {                       
+  char **ptr;
+  int  pipe1[2],count=0;
+  int  pid,status;
+
+  if(pipe(pipe1)!=0) perror("can't create pipes");
+  if((pid=fork())<0)perror("FORK ERROR");
+  else 
+   if (pid==0){
+      close(pipe1[0]);
+      close(1); 
+      if (( dup(pipe1[1]))<0) perror("can't dup");
+//      close(2); 
+//      open("/dev/null",O_RDWR,0777);
+      ptr = act->getargv(pt);
+      if ( execvp(ptr[0],ptr) < 0){    /* command execution */
+         Free(ptr);
+         cmnderror(msgsock);  
+         return(0);
+      }                                                                                     
+      exit(127);
+   } 
+   close(pipe1[1]);
+   act->outprocess(msgsock,pipe1[0]);
+   kill(pid,SIGINT);       /* killing the child process */
+   if((pid=waitpid(pid,&status,0))<0)perror("wait pid error");
+   close(pipe1[0]);
+   return  1;
+}
+/*******************************************************************************
+                WRITING BLOCK OF OUTPUT DATA INTO SOCKET
+Recieves the socket descriptor and the pipe descriptor as arguments.
+Writes block of data from the pipe to the socket.
+Returns an integer.
+*******************************************************************************/
+
+int writesock(int msgsock,int pipe1){
+   char *ptr;
+
+   while((ptr=getfrompipe(pipe1,2))!=NULL){
+    write_sock(msgsock,ptr,(strlen(ptr)));           /* sending data line by line */
+    free(ptr);
+   }                                     
+   msgsend(msgsock);
+   return(0);
+}
+/*******************************************************************************
+                        GIVING ERROR MESSAGE
+Recieves the socket descriptor as argument.
+Writes error message on the socket.
+Returns an integer.
+*******************************************************************************/
+
+int cmnderror(int msgsock){
+    char ERR[]="unknown command ...";
+    write_sock(msgsock,ERR,sizeof (ERR)+1);
+    write_sock(msgsock,&newline,1);             
+    msgsend(msgsock);
+    return(0);                                                         
+}
+int timeoutmsg(int msgsock){
+    char ERR[]="Timed out ...";
+    write_sock(msgsock,ERR,sizeof (ERR)+1);
+    write_sock(msgsock,&newline,1);             
+    msgsend(msgsock);
+    return(0);                                                         
+}
+/*******************************************************************************
+                             END OF MESSAGE
+Recieves the socket descriptor as argument.
+Writes end of message on the socket.
+It will not insert a new line before sending end of message.
+Returns an integer.
+*******************************************************************************/
+
+int msgsend(int msgsock){
+    char MSG[]="%%send";
+    write_sock(msgsock,MSG,sizeof(MSG)+1);  
+    write_sock(msgsock,&newline,1);         
+    return(0); 
+}
+void * process_message(void * sock){
+  int i,comp,rval,msgsock;
+  char buf[1000];
+  msgsock=*((int *)sock);
+  do {
+      i=0;
+      comp=0;
+      while(1){
+        if ((rval = read_sock(msgsock,&buf[i],1)) <=0)break;
+        if (buf[i]=='\0') break;
+        i++;
+      }
+//      if(rval<=0)continue;
+//      if(rval < 0) timeoutmsg(msgsock);
+      if(rval<=0) break;
+      if (*buf!='!'){
+         compare(buf,msgsock); 
+         comp=1; /* ie a system command is being used */
+      }
+      if(comp==1)continue;
+      process(buf+1,msgsock,writesock);   /* function calling */
+  } while(rval !=0);
+  close(msgsock);
+  return NULL;
+}
+int accept_connection(int sock,int entry) {
+     int msgsock;
+//     static int entry=-1;
+#if 0
+     if(entry==MAXTHDS) {
+       int i;
+       for(i=0;i<MAXTHDS;i++) pthread_join(pth[i],NULL);
+       entry=0;
+     }
+     entry++;
+     entry %=MAXTHDS;
+#else
+     if(pth[entry]!= NULL){
+              pthread_cancel(pth[entry]);
+              pthread_join(pth[entry],NULL);
+     }
+#endif
+     msgsock = accept(sock,(struct sockaddr *) 0,(int *) 0);
+     if( msgsock == -1){
+       perror("accept");
+       exit(1);
+     }
+     else {
+//       pthread_t th1;
+       pthread_create(pth+entry,NULL,process_message,(void *)(&msgsock));
+     }
+     return 1;
+}
+
+/*******************************************************************************
+                             MAIN FUNCTION
+It creates the socket,establish connection with clients and recieve commands.
+*******************************************************************************/
+
+
+
+void * idletime(void *arg) {
+  FILE *fp;
+  static double uptime_o=0.,idle_o=0.0;
+  static double uptime=0;
+  static double idle=-1;
+  int inrv=20;
+
+    fp = fopen("/proc/uptime","r");
+    if( fp ==NULL) return NULL;
+    fscanf(fp,"%lf%lf",&uptime,&idle_o);
+    fclose(fp);
+    sleep(inrv);
+  while(1) {
+    fp = fopen("/proc/uptime","r");
+    if( fp ==NULL) break;
+    fscanf(fp,"%lf%lf",&uptime,&idle);
+    fclose(fp);
+//    pthread_mutex_lock(&lock1);
+    idleper = (int) (((idle-idle_o)*100)/inrv);
+//    pthread_mutex_unlock(&lock1);
+    uptime_o=uptime;
+    idle_o = idle;
+    sleep(inrv);
+  }
+  return NULL;
+}
+int main(void) {
+ int entry =0;
+ int  sock,length,pid,id,rval,status,msgsock,i,comp;
+ char  *tmp,buf[1000];
+ pthread_t th1;
+
+ struct sockaddr_in server;
+ struct sched_param param;
+  daemon(0,1);
+  close(2);
+  open("/var/log/pserver.log",O_RDWR|O_CREAT|O_TRUNC,S_IRUSR|S_IWUSR);
+  fprintf(stderr,"Started Pserver(Ver 3.0)...\n");
+  fsync(2);
+  setsid();
+  for(i=0;i<MAXTHDS; i++) pth[i]=NULL;
+  pthread_mutex_init(&lock, NULL);
+  pthread_mutex_init(&lock1, NULL);
+#if 0
+  pthread_create(&th1,NULL,idletime,NULL);
+#endif
+  if((sock = socket(AF_INET,SOCK_STREAM,0))<0){
+    perror("opening stream socket");
+    exit(1);
+  }
+//  mlockall(MCL_CURRENT);
+//  mlockall(MCL_FUTURE);
+//  param.sched_priority = 90;
+//  sched_setscheduler(0,SCHED_FIFO,&param);
+  server.sin_family = AF_INET;
+  server.sin_addr.s_addr = INADDR_ANY;
+  server.sin_port =htons(1038);
+  if ( bind(sock,(struct sockaddr *)&server,sizeof server) < 0){
+    perror("binding stream socket");
+    exit(1);
+  }
+  length = sizeof server;
+  if (getsockname(sock,(struct sockaddr *)&server,&length)<0){
+    perror("getting socket name");
+    exit(1);
+  }
+  /* printf("Socket port #%d\n",ntohs(server.sin_port));*/
+  listen(sock,100);
+  do {
+     accept_connection(sock,entry);
+     entry++;
+     entry %=MAXTHDS;
+  } while(TRUE);
+  exit(0);
+}
+
+ 
